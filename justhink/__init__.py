@@ -21,7 +21,7 @@ def safeGet(key: str):
         return value
     
 AWS_REGION=safeGetWithDefault("AWS_REGION", "ap-south-1")
-def getKmsDecryptedValue(value: str, default_key: str):
+def getKmsDecryptedValue(value: str):
     try:
     # kms_client = boto3.client('kms', region_name=AWS_REGION, endpoint_url='http://localhost:4566')
         kms_client = boto3.client('kms', region_name=AWS_REGION)
@@ -31,7 +31,7 @@ def getKmsDecryptedValue(value: str, default_key: str):
         )
         return response['Plaintext'].decode('utf-8')
     except:
-        return safeGet(default_key)
+        return safeGet("OPENAPI_KEY")
 
 ENV = safeGetWithDefault("ENV", "DEV")
 OPENAPI_KEY = OPENAPI_KEY = getKmsDecryptedValue(safeGet("OPENAPI_KEY"))
