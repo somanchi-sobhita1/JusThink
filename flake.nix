@@ -26,6 +26,7 @@
         python312Packages.tenacity
         python312Packages.tqdm
         python312Packages.flask
+        python312Packages.boto3 
       ];
 
       installPhase = ''

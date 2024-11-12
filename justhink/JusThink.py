@@ -42,7 +42,7 @@ logging.basicConfig(
     ]
 )
 
-OPENAPI_KEY = os.getenv()
+OPENAPI_KEY = os.getenv("OPENAPI_KEY")
 
 client = OpenAI(api_key=OPENAPI_KEY)
 
