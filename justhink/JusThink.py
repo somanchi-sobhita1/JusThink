@@ -320,13 +320,23 @@ class VectorSearch:
 
         logging.info("Field embeddings built successfully.")
 
+    def load_field_vectors_from_given_data(self, json_file, embeddings_file_data):
+        if embeddings_file_data:
+            self.field_embeddings[json_file], self.field_ids[json_file] = embeddings_file_data
+            self.field_nn[json_file] = NearestNeighbors(n_neighbors=10, metric='cosine').fit(self.field_embeddings[json_file])
+            logging.info(f"Field embeddings for {json_file} loaded from given data successfully.")
+            return
+
     def load_or_build_vectors(self, rules_context, fields_context, log_embeddings_file, merchant_configurations_embeddings_file, transaction_meta_data_embeddings_file, rule_embeddings_file):
-        self.field_embeddings['Log.json'] = np.array(log_embeddings_file)
-        self.field_embeddings['Transaction Meta Data.json'] = np.array(merchant_configurations_embeddings_file)
-        self.field_embeddings['Merchant Configurations.json'] = np.array(transaction_meta_data_embeddings_file)
-        if rule_embeddings_file != []:
-            self.rule_embeddings = np.array(rule_embeddings_file)
+        self.load_field_vectors_from_given_data('Log.json', log_embeddings_file)
+        self.load_field_vectors_from_given_data('Merchant Configurations.json', merchant_configurations_embeddings_file)
+        self.load_field_vectors_from_given_data('Transaction Meta Data.json', transaction_meta_data_embeddings_file)
+
+        if rule_embeddings_file:
+            self.rule_embeddings, self.rule_ids = rule_embeddings_file
             self.rule_nn = NearestNeighbors(n_neighbors=5, metric='cosine').fit(self.rule_embeddings)
+            logging.info("Rule embeddings loaded from given data successfully.")
+            return
 
         # Check and build rule embeddings if they are not already built
         if self.rule_embeddings is None:
@@ -2032,6 +2042,17 @@ Issue 2:
         # Log the final traversal path
         logging.info(f"Final Traversal Path: {self.traversed_path}")
 
+def delete_file(file_path):
+    try:
+        # Check if the file exists
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"File '{file_path}' has been deleted successfully.")
+        else:
+            print(f"File '{file_path}' does not exist.")
+    except Exception as e:
+        print(f"Error deleting file '{file_path}': {e}")
+
 # def main():
 def analyze(udf_order_id, udf_merchant_id, log, merchant_details, transaction_details, log_context_file, merchant_context_file, transaction_context_file, log_embeddings_file, merchant_configurations_embeddings_file, transaction_meta_data_embeddings_file, rule_embeddings_file):
 
@@ -2077,6 +2098,19 @@ def analyze(udf_order_id, udf_merchant_id, log, merchant_details, transaction_de
     got_manager = GraphOfThoughts(udf_order_id, data_loader, vector_search, config=config)
     got_manager.run_analysis()
 
+    logging.info("Purging Used files")
+    delete_file(f"Log.json_context.json")
+    delete_file(f"Merchant Configurations.json_context.json")
+    delete_file(f"Transaction Meta Data.json_context.json")
+    delete_file(f"rules_context.json")
+    delete_file(f"embeddings_cache/Log.json_embeddings.pkl")
+    delete_file(f"embeddings_cache/Merchant Configurations.json_embeddings.pkl")
+    delete_file(f"embeddings_cache/Transaction Meta Data.json_embeddings.pkl")
+    delete_file(f"rules.json")
+    
+    delete_file(f"thought_graph_{udf_order_id}_final.png")
+    delete_file(f"RCA_Report_{udf_order_id}.txt")
+
     logging.info("Returning final object")
     return jsonify({
         'context_files' : {
@@ -2085,10 +2119,10 @@ def analyze(udf_order_id, udf_merchant_id, log, merchant_details, transaction_de
             'transaction_context': fields_context['Merchant Configurations.json']
         },
         'pkl_files' : {
-            'log_embeddings': str(vector_search.field_embeddings['Log.json']),
-            'merchant_configurations_embeddings': str(vector_search.field_embeddings['Transaction Meta Data.json']),
-            'transaction_meta_data_embeddings': str(vector_search.field_embeddings['Merchant Configurations.json']),
-            'rule_embeddings': str(vector_search.rule_embeddings)
+            'log_embeddings': str((vector_search.field_embeddings['Log.json'], vector_search.field_ids['Log.json'])),
+            'merchant_configurations_embeddings': str((vector_search.field_embeddings['Transaction Meta Data.json'], vector_search.field_ids['Transaction Meta Data.json'])),
+            'transaction_meta_data_embeddings': str((vector_search.field_embeddings['Merchant Configurations.json'], vector_search.field_ids['Merchant Configurations.json'])),
+            'rule_embeddings': str((vector_search.rule_embeddings, vector_search.rule_ids))
         },
         'results' : {
             'RCA_report': got_manager.summary,
