@@ -1,5 +1,6 @@
+from flask import jsonify
 from flask.cli import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, AzureOpenAI
 import json
 import logging
 import tiktoken
@@ -28,6 +29,8 @@ from functools import lru_cache
 import math
 from datetime import datetime, timedelta  # Added for temporal rewards
 import threading
+from jaf.core.llm import AzureGPTLLM
+from jaf.core.encode import AzureOpenAIEncoder
 
 
 # os.environ['ENV'] = 'local'
@@ -44,7 +47,35 @@ logging.basicConfig(
 
 OPENAPI_KEY = os.getenv("OPENAPI_KEY")
 
-client = OpenAI(api_key=OPENAPI_KEY)
+def safeGet(key: str):
+    value = os.environ.get(key)
+    if value is None:
+        print(f"ENV NOT FOUND for key: {key}")
+        return None
+    else:
+        return value
+
+AZURE_GPT_DEPLOYMENT_NAME = safeGet("AZURE_GPT_DEPLOYMENT_NAME")
+AZURE_GPT_MODEL_NAME = safeGet("AZURE_GPT_MODEL_NAME")
+AZURE_EMB_DEPLOYMENT_NAME =safeGet("AZURE_EMB_DEPLOYMENT_NAME")
+AZURE_OAI_BASE_URL = safeGet("AZURE_OAI_BASE_URL")
+AZURE_OAI_API_VERSION = safeGet("AZURE_OAI_API_VERSION")
+AZURE_OAI_API_KEY = safeGet("AZURE_OAI_API_KEY")
+
+
+# client = OpenAI(api_key=OPENAPI_KEY)
+client = AzureOpenAI(
+    azure_endpoint=AZURE_OAI_BASE_URL,
+    azure_deployment=AZURE_GPT_DEPLOYMENT_NAME,
+    api_version=AZURE_OAI_API_VERSION,
+    api_key=AZURE_OAI_API_KEY
+)
+encoder = AzureOpenAI(
+    azure_endpoint= AZURE_OAI_BASE_URL,
+    azure_deployment= AZURE_EMB_DEPLOYMENT_NAME,
+    api_version= AZURE_OAI_API_VERSION,
+    api_key= AZURE_OAI_API_KEY
+)
 
     
 class GracefulKiller:
@@ -110,7 +141,8 @@ class VectorSearch:
         if not os.path.exists(self.embeddings_dir):
             os.makedirs(self.embeddings_dir)
         # Tokenizer for the specific model
-        self.encoding = tiktoken.encoding_for_model("gpt-3.5-turbo-instruct")
+        self.encoding = tiktoken.encoding_for_model(AZURE_GPT_MODEL_NAME)
+        # encoding = tiktoken.get_encoding("cl100k_base")
 
     def count_tokens(self, text):
         return len(self.encoding.encode(text))
@@ -137,7 +169,7 @@ class VectorSearch:
     def generate_embedding(self, text):
         try:
             logging.info(f"Generating embedding for text: {text[:50]}...")
-            response = client.embeddings.create(
+            response = encoder.embeddings.create(
                 input=text,
                 model=self.embedding_model
             )
@@ -288,7 +320,24 @@ class VectorSearch:
 
         logging.info("Field embeddings built successfully.")
 
-    def load_or_build_vectors(self, rules_context, fields_context):
+    def load_field_vectors_from_given_data(self, json_file, embeddings_file_data):
+        if embeddings_file_data:
+            self.field_embeddings[json_file], self.field_ids[json_file] = embeddings_file_data
+            self.field_nn[json_file] = NearestNeighbors(n_neighbors=10, metric='cosine').fit(self.field_embeddings[json_file])
+            logging.info(f"Field embeddings for {json_file} loaded from given data successfully.")
+            return
+
+    def load_or_build_vectors(self, rules_context, fields_context, log_embeddings_file, merchant_configurations_embeddings_file, transaction_meta_data_embeddings_file, rule_embeddings_file):
+        self.load_field_vectors_from_given_data('Log.json', log_embeddings_file)
+        self.load_field_vectors_from_given_data('Merchant Configurations.json', merchant_configurations_embeddings_file)
+        self.load_field_vectors_from_given_data('Transaction Meta Data.json', transaction_meta_data_embeddings_file)
+
+        if rule_embeddings_file:
+            self.rule_embeddings, self.rule_ids = rule_embeddings_file
+            self.rule_nn = NearestNeighbors(n_neighbors=5, metric='cosine').fit(self.rule_embeddings)
+            logging.info("Rule embeddings loaded from given data successfully.")
+            return
+
         # Check and build rule embeddings if they are not already built
         if self.rule_embeddings is None:
             self.build_rule_vectors(rules_context)
@@ -390,7 +439,7 @@ class VectorSearch:
 
 # Data Loader Module
 class DataLoader:
-    def __init__(self, log, merchant_details, transaction_details):
+    def __init__(self, log, merchant_details, transaction_details, log_context_file, merchant_context_file, transaction_context_file):
         logging.info("Initializing DataLoader")
         load_dotenv()
         self.environment = os.getenv("ENV")
@@ -419,9 +468,9 @@ class DataLoader:
 
         # Load or generate context for fields (using context files)
         self.fields_context = {
-            'Log.json': self.load_or_generate_field_context('Log.json', self.log_json),
-            'Transaction Meta Data.json': self.load_or_generate_field_context('Transaction Meta Data.json', self.transaction_meta_json),
-            'Merchant Configurations.json': self.load_or_generate_field_context('Merchant Configurations.json', self.merchant_config_json),
+            'Log.json': self.load_or_generate_field_context('Log.json', self.log_json, log_context_file),
+            'Transaction Meta Data.json': self.load_or_generate_field_context('Transaction Meta Data.json', self.transaction_meta_json, transaction_context_file),
+            'Merchant Configurations.json': self.load_or_generate_field_context('Merchant Configurations.json', self.merchant_config_json, merchant_context_file),
         }
 
     def load(self, data):
@@ -495,9 +544,17 @@ class DataLoader:
                 fields.append(full_key)
         return fields
 
-    def load_or_generate_field_context(self, json_file, json_data):
+    def load_or_generate_field_context(self, json_file, json_data, file_context_data):
         context_file = f"{json_file}_context.json"
-        if os.path.exists(context_file):
+        if file_context_data:
+            try:
+                with open(context_file, 'w') as f:
+                    json.dump(file_context_data, f, indent=2)
+                logging.info(f"Context for {json_file} saved to {context_file}")
+            except Exception as e:
+                logging.error(f"Error saving context for {json_file}: {e}")
+            return file_context_data
+        elif os.path.exists(context_file):
             logging.info(f"Loading existing context for {json_file}")
             try:
                 with open(context_file, 'r') as f:
@@ -520,7 +577,7 @@ class DataLoader:
             logging.error(f"Error saving context for {json_file}: {e}")
         return context
 
-    @retry(stop=stop_after_attempt(5), wait=wait_random_exponential(min=1, max=10))
+    @retry(stop=stop_after_attempt(1), wait=wait_random_exponential(min=1, max=10))
     def generate_field_context(self, json_file, field):
         prompt = f"""
 You are an expert in payment systems. Provide a concise description of the following field from {json_file}:
@@ -530,13 +587,16 @@ Field: "{field}"
 Description:
 """
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=100,
                 temperature=0.2,
             )
-            description = response.choices[0].text.strip()
+            description = response.choices[0].message.content
             logging.info(f"Generated context for field '{field}': {description}")
             return description
         except Exception as e:
@@ -571,13 +631,24 @@ Output the rules in valid JSON format.
 """
 
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=1500,
                 temperature=0,
             )
-            self.rules_json = json.loads(response.choices[0].text.strip())
+            rules_proper_json = response.choices[0].message.content
+            rules_text_json = response.choices[0].message.content.split("```")
+            first_four = rules_text_json[1][:4]
+            print(first_four)
+            if first_four == 'json':
+                rules_proper_json = rules_text_json[1][4:] 
+            else :
+                rules_proper_json = response.choices[0].message.content
+            self.rules_json = json.loads(rules_proper_json)
 
             # Load or generate context for rules
             self.rules_context = self.load_or_generate_rules_context()
@@ -647,13 +718,16 @@ Rule Content: "{rule_content}"
 Description:
 """
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=150,
                 temperature=0.2,
             )
-            description = response.choices[0].text.strip()
+            description = response.choices[0].message.content
             logging.info(f"Generated context for rule '{rule_number}': {description}")
             return description
         except Exception as e:
@@ -966,6 +1040,7 @@ class GraphOfThoughts:
         # Initialize target network parameters
         self.target_q_update_frequency = config.get('target_q_update_frequency', 100) if config else 100
         self.iterations_since_target_update = 0  # Counter to track when to update target network
+        self.summary = ""
 
     def compute_priority(self, node):
         # Combine q_value and heuristic with weights
@@ -1130,13 +1205,16 @@ Confidence: [confidence score]
 Justification: [brief justification]
 """
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=150,
                 temperature=0,
             )
-            answer = response.choices[0].text.strip()
+            answer = response.choices[0].message.content
             logging.info(f"LLM response for RCA possibility:\n{answer}")
             match = re.search(r'Answer:\s*(YES|NO)', answer, re.IGNORECASE)
             confidence_match = re.search(r'Confidence:\s*([0-9]*\.?[0-9]+)', answer)
@@ -1246,13 +1324,16 @@ Example output:
             prompt = self.truncate_text(prompt, max_prompt_tokens)
 
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=max_completion_tokens,
                 temperature=0,
             )
-            next_thoughts_text = response.choices[0].text.strip()
+            next_thoughts_text = response.choices[0].message.content
             logging.debug(f"Received next thoughts from API: {next_thoughts_text}")
         except Exception as e:
             logging.error(f"Error in API call: {e}")
@@ -1481,13 +1562,16 @@ Issue 2:
 """
 
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=500,
                 temperature=0,
             )
-            rca = response.choices[0].text.strip()
+            rca = response.choices[0].message.content
             logging.info(f"Aggregated RCA generated with confidence scores: {rca}")
             return rca
         except openai.error.InvalidRequestError as e:
@@ -1587,6 +1671,20 @@ Issue 2:
 
         logging.info(f"Graph visualization with traversed path generated and saved as {filename}")
 
+    @staticmethod
+    def load_graph_png(file_path):
+        logging.info(f"Loading png file: {file_path}")
+        try:
+            with open(file_path, 'rb') as f:
+                png_data = f.read()
+                logging.info(f"Successfully loaded {file_path}")
+                return png_data
+        except FileNotFoundError:
+            logging.error(f"File not found: {file_path}")
+            return None
+        except Exception as e:
+            logging.error(f"Error loading png file {file_path}: {e}")
+            return None
         
     def generate_rca(self, node):
         logging.info(f"Generating RCA for node: {node.description}")
@@ -1671,13 +1769,16 @@ Attribution tag: [Your tag here]
 """
 
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=500,
                 temperature=0,
             )
-            rca = response.choices[0].text.strip()
+            rca = response.choices[0].message.content
             logging.info(f"RCA generated with confidence scores: {rca}")
             return rca
         except openai.error.InvalidRequestError as e:
@@ -1774,13 +1875,16 @@ Issue 2:
 """
 
         try:
-            response = client.completions.create(
-                model="gpt-3.5-turbo-instruct",
-                prompt=prompt,
+            response = client.chat.completions.create(
+                model=AZURE_GPT_DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "user",
+                    "content": prompt}
+                ],
                 max_tokens=300,
                 temperature=0,
             )
-            rca = response.choices[0].text.strip()
+            rca = response.choices[0].message.content
             logging.info(f"Forced RCA generated: {rca}")
             return rca
         except openai.error.InvalidRequestError as e:
@@ -1815,6 +1919,8 @@ Issue 2:
 
         if forced:
             summary += "Note: RCA was generated despite not meeting the confidence threshold.\n"
+        
+        self.summary = summary
 
         # Save summary to a file
         report_filename = f"RCA_Report_{self.udf_order_id}.txt"
@@ -1930,13 +2036,28 @@ Issue 2:
         # Visualize final graph
         self.visualize_graph(final=True)
 
+        # Read graph data
+        self.graph_png = self.load_graph_png(f"thought_graph_{self.udf_order_id}_final.png")
+
         # Log the final traversal path
         logging.info(f"Final Traversal Path: {self.traversed_path}")
 
-# def main():
-def analyze(udf_order_id, udf_merchant_id, log, merchant_details, transaction_details):
+def delete_file(file_path):
+    try:
+        # Check if the file exists
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"File '{file_path}' has been deleted successfully.")
+        else:
+            print(f"File '{file_path}' does not exist.")
+    except Exception as e:
+        print(f"Error deleting file '{file_path}': {e}")
 
-    data_loader = DataLoader(log, merchant_details, transaction_details)
+# def main():
+def analyze(udf_order_id, udf_merchant_id, log, merchant_details, transaction_details, log_context_file, merchant_context_file, transaction_context_file, log_embeddings_file, merchant_configurations_embeddings_file, transaction_meta_data_embeddings_file, rule_embeddings_file):
+
+    data_loader = DataLoader(log, merchant_details, transaction_details, log_context_file, merchant_context_file, transaction_context_file)
+    
 
     # Convert context to JSON rules
     rules_context = data_loader.convert_context_to_json_rules()
@@ -1948,7 +2069,7 @@ def analyze(udf_order_id, udf_merchant_id, log, merchant_details, transaction_de
     fields_context = data_loader.fields_context
 
     vector_search = VectorSearch()
-    vector_search.load_or_build_vectors(rules_context, fields_context)
+    vector_search.load_or_build_vectors(rules_context, fields_context, log_embeddings_file, merchant_configurations_embeddings_file, transaction_meta_data_embeddings_file, rule_embeddings_file)
 
     logging.info("All embeddings and context files have been generated and saved successfully.")
 
@@ -1977,3 +2098,34 @@ def analyze(udf_order_id, udf_merchant_id, log, merchant_details, transaction_de
     got_manager = GraphOfThoughts(udf_order_id, data_loader, vector_search, config=config)
     got_manager.run_analysis()
 
+    logging.info("Purging Used files")
+    delete_file(f"Log.json_context.json")
+    delete_file(f"Merchant Configurations.json_context.json")
+    delete_file(f"Transaction Meta Data.json_context.json")
+    delete_file(f"rules_context.json")
+    delete_file(f"embeddings_cache/Log.json_embeddings.pkl")
+    delete_file(f"embeddings_cache/Merchant Configurations.json_embeddings.pkl")
+    delete_file(f"embeddings_cache/Transaction Meta Data.json_embeddings.pkl")
+    delete_file(f"rules.json")
+    
+    delete_file(f"thought_graph_{udf_order_id}_final.png")
+    delete_file(f"RCA_Report_{udf_order_id}.txt")
+
+    logging.info("Returning final object")
+    return jsonify({
+        'context_files' : {
+            'log_context': fields_context['Log.json'],
+            'merchant_context': fields_context['Transaction Meta Data.json'],
+            'transaction_context': fields_context['Merchant Configurations.json']
+        },
+        'pkl_files' : {
+            'log_embeddings': str((vector_search.field_embeddings['Log.json'], vector_search.field_ids['Log.json'])),
+            'merchant_configurations_embeddings': str((vector_search.field_embeddings['Transaction Meta Data.json'], vector_search.field_ids['Transaction Meta Data.json'])),
+            'transaction_meta_data_embeddings': str((vector_search.field_embeddings['Merchant Configurations.json'], vector_search.field_ids['Merchant Configurations.json'])),
+            'rule_embeddings': str((vector_search.rule_embeddings, vector_search.rule_ids))
+        },
+        'results' : {
+            'RCA_report': got_manager.summary,
+            'thought_graph': str(got_manager.graph_png)
+        }
+    })
